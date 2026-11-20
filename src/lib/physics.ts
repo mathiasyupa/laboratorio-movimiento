@@ -114,13 +114,38 @@ export function trackingError(detections: Detection[], marks: Detection[], meter
 
   const rmsePixels = rmse(0, 0);
   const rmseNoOffsetPixels = rmse(offsetX, offsetY);
+  const offsetPixels = Math.hypot(offsetX, offsetY);
+  // Se cumple rmse² = desfase² + variación²: el error total se reparte en sistemático y aleatorio.
   return {
     count,
     rmsePixels,
     rmseMeters: rmsePixels * metersPerPixel,
     rmseNoOffsetPixels,
     rmseNoOffsetMeters: rmseNoOffsetPixels * metersPerPixel,
+    offsetPixels,
+    offsetMeters: offsetPixels * metersPerPixel,
   };
+}
+
+// Error de cada detección respecto de la marca manual, a lo largo de la rampa y en mm.
+// Positivo: la detección va por delante de la marca, en el sentido en que avanza el carrito.
+export function alongRampErrors(detections: Detection[], marks: Detection[], ruler: [Point, Point], metersPerPixel: number) {
+  const [p0, p1] = ruler;
+  const length = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+  const ux = (p1.x - p0.x) / length;
+  const uy = (p1.y - p0.y) / length;
+  const ordered = [...marks].sort((a, b) => a.t - b.t);
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
+  const travel = ordered.length > 1 ? (last.x - first.x) * ux + (last.y - first.y) * uy : 0;
+  const direction = travel >= 0 ? 1 : -1;
+  const byTime = new Map(detections.map((d) => [d.t, d]));
+  return marks.flatMap((mark) => {
+    const detection = byTime.get(mark.t);
+    if (!detection) return [];
+    const along = (detection.x - mark.x) * ux + (detection.y - mark.y) * uy;
+    return [{ t: mark.t, mm: along * direction * metersPerPixel * 1000 }];
+  });
 }
 
 export type Measured = { value: number; u: number };

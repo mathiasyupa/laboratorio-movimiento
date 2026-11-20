@@ -40,8 +40,9 @@ Otros comandos: `npm run build` (compilar), `npm run lint` (revisar el código) 
 2. Abrir la app y subir el video. La regla se detecta sola con IA; hay que escribir su **largo total** en metros y revisar que la línea amarilla calce sobre ella.
 3. Elegir el color de la marca (método por color), indicar el ángulo θ con su incertidumbre, los fps del video, y marcar con la barra de tiempo el inicio y el fin del tramo en que el carrito se mueve libre.
 4. En la pestaña *Carrito*, escribir la masa total, el número de ruedas, la masa de cada rueda, su forma y la resistencia μ.
-5. Pulsar **Analizar**. Opcionalmente, **Marcar fotogramas a mano** para medir el error de seguimiento.
-6. **Guardar en corridas** y descargar el CSV. Las repeticiones del mismo ángulo y método se resumen con promedio, desviación estándar y error de la media.
+5. Pulsar **Analizar**. Con el método *Ambos*, un interruptor en los resultados permite comparar con **los fotogramas de cada método** o con **exactamente los mismos fotogramas en los dos**, para separar la diferencia del detector de la que viene de la cantidad de datos.
+6. Opcional: **Marcar fotogramas a mano** para medir el error de seguimiento. La app separa el error total en un **desfase fijo** (sistemático) y una **variación** entre fotogramas (aleatoria), con total² = desfase² + variación², y lo muestra también en una gráfica.
+7. **Guardar en corridas** y descargar el CSV. Las repeticiones del mismo ángulo y método se resumen con promedio, desviación estándar y error de la media; las corridas hechas con los mismos fotogramas se resumen aparte.
 
 Para medir μ, se hace primero una corrida en plano (θ = 0°): la app despeja μ con su incertidumbre, y ese valor se usa en las corridas en rampa.
 

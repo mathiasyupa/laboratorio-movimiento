@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import {
+  alongRampErrors,
   discrepancy,
   fitQuadratic,
   localDerivatives,
@@ -36,7 +37,10 @@ export type RawRun = {
 };
 
 const MIN_FRAMES_WITHOUT_OFFSET = 3;
+const MIN_COMMON_FRAMES = 4;
 const COMPATIBLE_SIGMAS = 2;
+
+type ChartId = "position" | "velocity" | "acceleration" | "error";
 
 const METHODS = [
   { key: "color", label: "Convencional (color)", colorVar: "--series-1" },
@@ -87,17 +91,37 @@ function downloadCsv(run: RawRun, marks: Detection[]) {
 type Props = { run: RawRun; marks: Detection[]; onSave: (entries: RunEntry[]) => void };
 
 export function Results({ run, marks, onSave }: Props) {
-  const [savedMarks, setSavedMarks] = useState<Detection[] | null>(null);
-  const [chart, setChart] = useState<"position" | "velocity" | "acceleration">("position");
+  const [savedFor, setSavedFor] = useState<{ marks: Detection[]; matched: boolean } | null>(null);
+  const [chart, setChart] = useState<ChartId>("position");
+  const [sameFrames, setSameFrames] = useState(false);
+  const bothUsed = run.usedColor && run.usedGemini;
+  const commonCount = useMemo(() => {
+    const geminiTimes = new Set(run.geminiDetections.map((d) => d.t));
+    return run.colorDetections.filter((d) => geminiTimes.has(d.t)).length;
+  }, [run]);
+  const canMatch = bothUsed && commonCount >= MIN_COMMON_FRAMES;
+  const matched = sameFrames && canMatch;
+
+  // Con "los mismos fotogramas" cada método se queda solo con los que el otro también detectó.
+  const frames = useMemo(() => {
+    if (!matched) return { color: run.colorDetections, gemini: run.geminiDetections };
+    const geminiTimes = new Set(run.geminiDetections.map((d) => d.t));
+    const colorTimes = new Set(run.colorDetections.map((d) => d.t));
+    return {
+      color: run.colorDetections.filter((d) => geminiTimes.has(d.t)),
+      gemini: run.geminiDetections.filter((d) => colorTimes.has(d.t)),
+    };
+  }, [run, matched]);
+
   const tracking = useMemo(
     () => ({
-      color: trackingError(run.colorDetections, marks, run.metersPerPixel),
-      gemini: trackingError(run.geminiDetections, marks, run.metersPerPixel),
+      color: trackingError(frames.color, marks, run.metersPerPixel),
+      gemini: trackingError(frames.gemini, marks, run.metersPerPixel),
     }),
-    [run, marks],
+    [frames, marks, run.metersPerPixel],
   );
-  const color = useMemo(() => analyzeMethod(run.colorDetections, run), [run]);
-  const gemini = useMemo(() => analyzeMethod(run.geminiDetections, run), [run]);
+  const color = useMemo(() => analyzeMethod(frames.color, run), [frames, run]);
+  const gemini = useMemo(() => analyzeMethod(frames.gemini, run), [frames, run]);
   const theory = useMemo(() => theoreticalAcceleration(run.model), [run]);
   const analyses = { color, gemini };
   const isFlat = run.model.thetaDeg === 0;
@@ -132,8 +156,20 @@ export function Results({ run, marks, onSave }: Props) {
     if (acceleration.length > 0) {
       acceleration.push({ label: "Teórica (modelo)", colorVar: "--ink-2", style: "dashed", points: curve(tMin, tMax, () => theory.value) });
     }
-    return { position, velocity, acceleration };
-  }, [color, gemini, theory]);
+
+    const error: ChartSeries[] = [];
+    if (marks.length > 0) {
+      for (const method of METHODS) {
+        const detections = method.key === "color" ? frames.color : frames.gemini;
+        const visible = method.key === "color" ? run.usedColor : run.usedGemini;
+        const points = visible ? alongRampErrors(detections, marks, run.ruler, run.metersPerPixel).map((e) => ({ x: e.t, y: e.mm })) : [];
+        if (points.length > 0) error.push({ colorVar: method.colorVar, label: method.label, style: "points", points });
+      }
+      const times = marks.map((m) => m.t);
+      error.push({ label: "Sin error", colorVar: "--ink-2", style: "dashed", points: [{ x: Math.min(...times), y: 0 }, { x: Math.max(...times), y: 0 }] });
+    }
+    return { position, velocity, acceleration, error };
+  }, [color, gemini, theory, frames, marks, run]);
 
   const betweenMethods = useMemo(() => {
     if (!color || !gemini) return null;
@@ -146,7 +182,11 @@ export function Results({ run, marks, onSave }: Props) {
     // El centro de la caja de Gemini y la marca de color son puntos distintos del carrito: se quita ese desfase fijo.
     const offset = pairs.reduce((sum, v) => sum + v, 0) / pairs.length;
     const rmse = Math.sqrt(pairs.reduce((sum, v) => sum + (v - offset) ** 2, 0) / pairs.length);
-    return { rmse, sigmas: discrepancy(color.acceleration, gemini.acceleration) };
+    return {
+      rmse,
+      accelerationDifference: Math.abs(gemini.acceleration.value - color.acceleration.value),
+      sigmas: discrepancy(color.acceleration, gemini.acceleration),
+    };
   }, [color, gemini]);
 
   const visibleMethods = METHODS.filter((method) => (method.key === "color" ? run.usedColor : run.usedGemini));
@@ -155,10 +195,14 @@ export function Results({ run, marks, onSave }: Props) {
     return count > 0 ? (key === "color" ? run.colorMs : run.geminiMs) / count : null;
   };
   const differencePct = (a: Measured) => (theory.value === 0 ? null : ((a.value - theory.value) / Math.abs(theory.value)) * 100);
+  // Con muy pocos fotogramas, separar desfase y variación da números sin sentido.
   const noOffsetError = (key: "color" | "gemini") => {
     const error = tracking[key];
-    // Con muy pocos fotogramas, quitar el desfase deja un error artificialmente cercano a cero.
     return error && error.count >= MIN_FRAMES_WITHOUT_OFFSET ? error.rmseNoOffsetMeters * 1000 : null;
+  };
+  const offsetError = (key: "color" | "gemini") => {
+    const error = tracking[key];
+    return error && error.count >= MIN_FRAMES_WITHOUT_OFFSET ? error.offsetMeters * 1000 : null;
   };
 
   const save = () => {
@@ -172,7 +216,7 @@ export function Results({ run, marks, onSave }: Props) {
         savedAt,
         video: run.video,
         thetaDeg: run.model.thetaDeg,
-        method: method.label,
+        method: matched ? `${method.label} · mismos fotogramas` : method.label,
         a: result.acceleration.value,
         uA: result.acceleration.u,
         aTheory: theory.value,
@@ -186,10 +230,11 @@ export function Results({ run, marks, onSave }: Props) {
         msPerFrame: msPerFrame(method.key),
         manualRmseMm: error ? error.rmseMeters * 1000 : null,
         manualRmseNoOffsetMm: noOffsetError(method.key),
+        manualOffsetMm: offsetError(method.key),
       }];
     });
     onSave(entries);
-    setSavedMarks(marks);
+    setSavedFor({ marks, matched });
   };
 
   const row = (label: string, value: (key: "color" | "gemini") => string) => (
@@ -207,7 +252,7 @@ export function Results({ run, marks, onSave }: Props) {
   const withU = (m: Measured, digits: number) => `${m.value.toFixed(digits)} ± ${m.u.toFixed(digits)}`;
   const sigmaText = (sigmas: number | null) =>
     sigmas === null ? "—" : `${sigmas.toFixed(1)} σ (${sigmas < COMPATIBLE_SIGMAS ? "compatible" : "no compatible"})`;
-  const saved = savedMarks === marks;
+  const saved = savedFor?.marks === marks && savedFor.matched === matched;
 
   const table = (rows: React.ReactNode) => (
     <div className="overflow-x-auto">
@@ -224,11 +269,14 @@ export function Results({ run, marks, onSave }: Props) {
       </table>
     </div>
   );
-  const chartTabs = [
+  const chartTabs: { id: ChartId; label: string }[] = [
     { id: "position", label: "Posición" },
     { id: "velocity", label: "Velocidad" },
     { id: "acceleration", label: "Aceleración" },
-  ] as const;
+    ...(marks.length > 0 ? [{ id: "error" as const, label: "Error de seguimiento" }] : []),
+  ];
+  const activeChart: ChartId = chart === "error" && marks.length === 0 ? "position" : chart;
+  const frameCount = (key: "color" | "gemini") => (key === "color" ? frames.color.length : frames.gemini.length);
 
   return (
     <section className="space-y-3">
@@ -254,6 +302,36 @@ export function Results({ run, marks, onSave }: Props) {
               En plano y con μ = 0 la teoría predice a = 0: usa esta corrida para medir μ y copia el valor de «μ medido en plano» en la pestaña Carrito.
             </p>
           )}
+          {bothUsed && (
+            <div className="space-y-1.5">
+              <div role="group" aria-label="Fotogramas que se comparan" className="grid grid-cols-2 gap-1 rounded-md border border-line p-1">
+                {[
+                  { value: false, label: "Los de cada método" },
+                  { value: true, label: `Los mismos en ambos (${commonCount})` },
+                ].map((option) => (
+                  <button
+                    key={String(option.value)}
+                    type="button"
+                    aria-pressed={matched === option.value}
+                    disabled={option.value && !canMatch}
+                    onClick={() => setSameFrames(option.value)}
+                    className={`rounded px-2 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50 ${
+                      matched === option.value ? "bg-[var(--series-1)] text-white" : "text-ink-2 hover:bg-background"
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-ink-2">
+                {matched
+                  ? `Los dos métodos usan exactamente los mismos ${commonCount} fotogramas: la diferencia viene solo del detector.`
+                  : canMatch
+                    ? `Color usa ${run.colorDetections.length} fotogramas y Gemini ${run.geminiDetections.length}: la diferencia también puede venir de la cantidad de datos.`
+                    : "No hay suficientes fotogramas detectados por ambos métodos para compararlos con los mismos."}
+              </p>
+            </div>
+          )}
           {table(
             <>
               {row("Aceleración medida (m/s²)", (k) => metric(k, (r) => withU(r.acceleration, 3)))}
@@ -265,11 +343,23 @@ export function Results({ run, marks, onSave }: Props) {
               {row(isFlat ? "μ medido en plano" : "μ que explicaría la medición", (k) => metric(k, (r) => withU(r.resistance, 4)))}
               {marks.length > 0 && (
                 <>
-                  {row("Error vs. marcado manual (mm)", (k) => (tracking[k] ? (tracking[k].rmseMeters * 1000).toFixed(1) : "—"))}
-                  {row("Sin el desfase fijo (mm)", (k) => noOffsetError(k)?.toFixed(1) ?? "—")}
+                  {row("Error total vs. marcado manual (mm)", (k) => (tracking[k] ? (tracking[k].rmseMeters * 1000).toFixed(1) : "—"))}
+                  {row("   Sistemático: desfase fijo (mm)", (k) => offsetError(k)?.toFixed(1) ?? "—")}
+                  {row("   Aleatorio: variación (mm)", (k) => noOffsetError(k)?.toFixed(1) ?? "—")}
                 </>
               )}
             </>,
+          )}
+          {marks.length > 0 && (
+            <p className="text-xs text-ink-2">
+              El <span className="font-medium text-foreground">desfase fijo</span> es el error que se repite igual en todos los fotogramas (por ejemplo, Gemini marca el centro de la caja del carrito y el método por color, el centro de la marca). La <span className="font-medium text-foreground">variación</span> es lo que cambia de un fotograma a otro. Se cumple: total² = desfase² + variación². Con menos de {MIN_FRAMES_WITHOUT_OFFSET} fotogramas marcados no se separan.
+            </p>
+          )}
+          {betweenMethods && (
+            <p className="rounded-md bg-background px-3 py-2 text-xs">
+              <span className="font-semibold">Entre los dos métodos: </span>
+              la aceleración difiere en <span className="font-mono tabular-nums">{betweenMethods.accelerationDifference.toFixed(3)} m/s²</span> ({sigmaText(betweenMethods.sigmas)}) y la posición varía <span className="font-mono tabular-nums">{(betweenMethods.rmse * 1000).toFixed(1)} mm</span>, sin contar el desfase fijo.
+            </p>
           )}
           <details className="group text-sm">
             <summary className="cursor-pointer text-xs font-medium text-ink-2 hover:text-foreground">Más detalles del ajuste y de los tiempos</summary>
@@ -278,7 +368,13 @@ export function Results({ run, marks, onSave }: Props) {
                 <>
                   {row("R² del ajuste cuadrático", (k) => metric(k, (r) => r.fit.r2.toFixed(4)))}
                   {row("Residuo del ajuste (mm)", (k) => metric(k, (r) => (r.fit.rmse * 1000).toFixed(2)))}
-                  {row("Fotogramas detectados", (k) => (k === "color" ? `${run.colorDetections.length} de ${run.totalSamples}` : `${run.geminiDetections.length} de ${run.geminiRequested}`))}
+                  {row("Fotogramas usados", (k) =>
+                    matched
+                      ? `${frameCount(k)} (los mismos)`
+                      : k === "color"
+                        ? `${run.colorDetections.length} de ${run.totalSamples}`
+                        : `${run.geminiDetections.length} de ${run.geminiRequested}`,
+                  )}
                   {row("Tiempo del método (ms)", (k) => (k === "color" ? run.colorMs.toFixed(0) : run.geminiMs.toFixed(0)))}
                   {row("Tiempo por fotograma (ms)", (k) => msPerFrame(k)?.toFixed(1) ?? "—")}
                   {marks.length > 0 && (
@@ -291,10 +387,7 @@ export function Results({ run, marks, onSave }: Props) {
               )}
               <p className="text-xs text-ink-2">
                 La incertidumbre medida combina el error del ajuste con el de calibración; la teórica viene de θ y μ. Menos de {COMPATIBLE_SIGMAS} σ de discrepancia es compatible.
-                {marks.length > 0 && run.usedColor && run.usedGemini && " El desfase fijo aparece porque Gemini da el centro de la caja del carrito, no la marca de color."}
                 {` Extraer los fotogramas tomó ${run.extractionMs.toFixed(0)} ms, fuera del tiempo de los métodos.`}
-                {betweenMethods &&
-                  ` Entre métodos: ${(betweenMethods.rmse * 1000).toFixed(1)} mm de RMSE en posición, sin el desfase fijo, y ${sigmaText(betweenMethods.sigmas)} en aceleración.`}
               </p>
             </div>
           </details>
@@ -309,15 +402,15 @@ export function Results({ run, marks, onSave }: Props) {
                   key={tab.id}
                   type="button"
                   role="tab"
-                  aria-selected={chart === tab.id}
+                  aria-selected={activeChart === tab.id}
                   onClick={() => setChart(tab.id)}
-                  className={`rounded px-3 py-1 text-xs font-medium ${chart === tab.id ? "bg-[var(--series-1)] text-white" : "text-ink-2 hover:text-foreground"}`}
+                  className={`rounded px-3 py-1 text-xs font-medium ${activeChart === tab.id ? "bg-[var(--series-1)] text-white" : "text-ink-2 hover:text-foreground"}`}
                 >
                   {tab.label}
                 </button>
               ))}
             </div>
-            {chart === "position" && (
+            {activeChart === "position" && (
               <KinematicsChart
                 title="Posición sobre la rampa"
                 hint="Puntos: posición medida en cada fotograma. Línea: parábola ajustada."
@@ -326,7 +419,7 @@ export function Results({ run, marks, onSave }: Props) {
                 series={charts.position}
               />
             )}
-            {chart === "velocity" && (
+            {activeChart === "velocity" && (
               <KinematicsChart
                 title="Velocidad"
                 hint="Puntos: calculados con posiciones vecinas. Línea: derivada del ajuste; recta si la aceleración es constante."
@@ -335,13 +428,22 @@ export function Results({ run, marks, onSave }: Props) {
                 series={charts.velocity}
               />
             )}
-            {chart === "acceleration" && (
+            {activeChart === "acceleration" && (
               <KinematicsChart
                 title="Aceleración"
                 hint="Puntos: calculados con posiciones vecinas. Línea continua: ajuste. Punteada: teoría con rotación y resistencia."
                 yLabel="Aceleración (m/s²)"
                 unit="m/s²"
                 series={charts.acceleration}
+              />
+            )}
+            {activeChart === "error" && (
+              <KinematicsChart
+                title="Error de seguimiento"
+                hint="Cada punto es un fotograma marcado a mano: detectado menos marcado, a lo largo de la rampa (positivo = la detección va por delante). Puntos alejados de la línea de cero: error sistemático. Puntos dispersos: error aleatorio."
+                yLabel="Detectado − marcado (mm)"
+                unit="mm"
+                series={charts.error}
               />
             )}
           </div>

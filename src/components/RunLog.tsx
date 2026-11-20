@@ -7,12 +7,12 @@ const COLUMNS: [keyof RunEntry, string][] = [
   ["a", "a_m_s2"], ["uA", "u_a_m_s2"], ["aTheory", "a_teorica_m_s2"], ["uTheory", "u_a_teorica_m_s2"],
   ["diffPct", "diferencia_pct"], ["sigmas", "discrepancia_sigmas"], ["mu", "mu"], ["uMu", "u_mu"],
   ["r2", "r2"], ["frames", "fotogramas"], ["msPerFrame", "ms_por_fotograma"],
-  ["manualRmseMm", "rmse_manual_mm"], ["manualRmseNoOffsetMm", "rmse_manual_sin_desfase_mm"],
+  ["manualRmseMm", "rmse_manual_mm"], ["manualOffsetMm", "desfase_fijo_mm"], ["manualRmseNoOffsetMm", "variacion_mm"],
 ];
 
 function toCsv(entries: RunEntry[]) {
   const cell = (value: RunEntry[keyof RunEntry]) => {
-    if (value === null) return "";
+    if (value === null || value === undefined) return "";
     const text = String(value);
     return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
