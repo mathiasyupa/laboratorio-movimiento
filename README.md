@@ -1,36 +1,76 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Laboratorio de Movimiento
 
-## Getting Started
+Aplicación web que mide la **posición, velocidad y aceleración de un carrito en un plano inclinado** a partir de un video. Localiza el carrito con dos métodos —**IA (Gemini)** y **seguimiento por color (HSV)**— y compara cada resultado con un modelo teórico que incluye la rotación de las ruedas y la resistencia al movimiento, con sus incertidumbres.
 
-First, run the development server:
+Versión publicada: https://laboratorio-movimiento.vercel.app
+
+## Cómo correrla
+
+Requisitos: Node.js 20 o superior y una clave de la API de Gemini (Google AI Studio).
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.example .env     # y escribir la clave en GEMINI_API_KEY
+npm run dev              # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+El método por color funciona sin clave. La clave solo se usa en el servidor (`src/app/api`) y nunca llega al navegador.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Variables de entorno (`.env`):
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Variable | Para qué sirve | Valor por defecto |
+|---|---|---|
+| `GEMINI_API_KEY` | Clave de la API de Gemini | (obligatoria para usar IA) |
+| `GEMINI_MODEL` | Modelo de Gemini | `gemini-3.5-flash-lite` |
 
-## Learn More
+Otros comandos: `npm run build` (compilar), `npm run lint` (revisar el código) y `npx vercel deploy --prod` (publicar).
 
-To learn more about Next.js, take a look at the following resources:
+## Estructura
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Carpeta | Contenido |
+|---|---|
+| `src/app/` | Página principal, diseño general y estilos |
+| `src/app/api/` | Rutas del servidor: `detect-gemini` (carrito) y `detect-ruler` (regla). Son lo único que usa la clave |
+| `src/components/` | Interfaz: pantalla principal, resultados, gráficas y corridas guardadas |
+| `src/lib/` | Lógica: física y ajustes, detección por color, ajuste fino de la regla, video, conexión con Gemini y almacenamiento de corridas |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Cómo reproducir un resultado
 
-## Deploy on Vercel
+1. Grabar el carrito con la cámara fija y una **regla visible, paralela al movimiento y en el mismo plano** que él. Para el método por color, pegar una marca de color al carrito.
+2. Abrir la app y subir el video. La regla se detecta sola con IA; hay que escribir su **largo total** en metros y revisar que la línea amarilla calce sobre ella.
+3. Elegir el color de la marca (método por color), indicar el ángulo θ con su incertidumbre, los fps del video, y marcar con la barra de tiempo el inicio y el fin del tramo en que el carrito se mueve libre.
+4. En la pestaña *Carrito*, escribir la masa total, el número de ruedas, la masa de cada rueda, su forma y la resistencia μ.
+5. Pulsar **Analizar**. Opcionalmente, **Marcar fotogramas a mano** para medir el error de seguimiento.
+6. **Guardar en corridas** y descargar el CSV. Las repeticiones del mismo ángulo y método se resumen con promedio, desviación estándar y error de la media.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Para medir μ, se hace primero una corrida en plano (θ = 0°): la app despeja μ con su incertidumbre, y ese valor se usa en las corridas en rampa.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Parámetros por defecto
+
+| Parámetro | Valor |
+|---|---|
+| Fotogramas por solicitud a Gemini | hasta 20 |
+| Muestras por segundo | 30 |
+| fps del video | 60 |
+| Tolerancia de tono (HSV) | 15° |
+| Incertidumbre del ángulo θ | 0.5° |
+| Incertidumbre de la regla | 1 mm |
+| g | 9.81 m/s² |
+| Ancho máximo de trabajo del fotograma | 960 px |
+
+## Modelo
+
+La posición se ajusta por mínimos cuadrados a una parábola, `x(t) = At² + Bt + C`, y la aceleración medida es `a = 2A`. La teoría es
+
+```
+a = g (sin θ − μ cos θ) / (1 + I/MR²),    I/MR² = n·k·m / M
+```
+
+con `g` la gravedad (m/s²), `θ` el ángulo de la rampa, `μ` la resistencia al movimiento (adimensional), `M` la masa total del carrito (kg), `n` el número de ruedas, `m` la masa de cada rueda (kg) y `k` = ½ para un disco o 1 para un aro. La incertidumbre de la medición combina el error del ajuste con el de la calibración; la de la teoría se propaga desde `θ` y `μ`. La discrepancia se expresa como `|a_exp − a_teo| / √(u_exp² + u_teo²)`, y menos de 2 se considera compatible.
+
+## Estado y limitaciones
+
+- No hay pruebas automáticas. El funcionamiento se verificó con videos sintéticos de aceleración conocida generados a mano; falta validarlo con videos reales del carrito.
+- Gemini depende de internet y de la cuota de la clave; el tiempo de respuesta varía.
+- Las corridas guardadas viven en el almacenamiento del navegador de cada persona; hay que compartir el CSV.
+- La escala supone cámara perpendicular al plano del movimiento y regla en ese mismo plano.
