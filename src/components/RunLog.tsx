@@ -1,10 +1,12 @@
 "use client";
 
+import { repeatStats } from "@/lib/physics";
 import type { RunEntry } from "@/lib/runStore";
 
 const COLUMNS: [keyof RunEntry, string][] = [
   ["savedAt", "fecha"], ["video", "video"], ["thetaDeg", "theta_grados"], ["method", "metodo"],
-  ["a", "a_m_s2"], ["uA", "u_a_m_s2"], ["aTheory", "a_teorica_m_s2"], ["uTheory", "u_a_teorica_m_s2"],
+  ["a", "a_m_s2"], ["uA", "u_a_m_s2"], ["uAFit", "u_a_ajuste_m_s2"], ["uACalibration", "u_a_regla_m_s2"],
+  ["v0", "v0_m_s"], ["uV0", "u_v0_m_s"], ["aTheory", "a_teorica_m_s2"], ["uTheory", "u_a_teorica_m_s2"],
   ["diffPct", "diferencia_pct"], ["sigmas", "discrepancia_sigmas"], ["mu", "mu"], ["uMu", "u_mu"],
   ["r2", "r2"], ["frames", "fotogramas"], ["msPerFrame", "ms_por_fotograma"],
   ["manualRmseMm", "rmse_manual_mm"], ["manualOffsetMm", "desfase_fijo_mm"], ["manualRmseNoOffsetMm", "variacion_mm"],
@@ -19,7 +21,8 @@ function toCsv(entries: RunEntry[]) {
   return [COLUMNS.map(([, header]) => header).join(","), ...entries.map((entry) => COLUMNS.map(([key]) => cell(entry[key])).join(","))].join("\n");
 }
 
-// Repeticiones del mismo ángulo y método: promedio, desviación estándar y error estándar de la media.
+// Repeticiones del mismo ángulo y método. Los análisis del mismo video se promedian antes de calcular la
+// dispersión, porque usan las mismas imágenes y no son experimentos independientes.
 function summarize(entries: RunEntry[]) {
   const groups = new Map<string, RunEntry[]>();
   for (const entry of entries) {
@@ -28,11 +31,9 @@ function summarize(entries: RunEntry[]) {
   }
   return [...groups.values()]
     .map((group) => {
-      const n = group.length;
-      const mean = group.reduce((sum, e) => sum + e.a, 0) / n;
-      const sd = n > 1 ? Math.sqrt(group.reduce((sum, e) => sum + (e.a - mean) ** 2, 0) / (n - 1)) : null;
-      const theory = group.reduce((sum, e) => sum + e.aTheory, 0) / n;
-      return { thetaDeg: group[0].thetaDeg, method: group[0].method, n, mean, sd, sem: sd === null ? null : sd / Math.sqrt(n), theory };
+      const stats = repeatStats(group.map((e) => ({ video: e.video, value: e.a })));
+      const theory = group.reduce((sum, e) => sum + e.aTheory, 0) / group.length;
+      return { thetaDeg: group[0].thetaDeg, method: group[0].method, ...stats, theory };
     })
     .sort((a, b) => a.thetaDeg - b.thetaDeg || a.method.localeCompare(b.method));
 }
@@ -63,11 +64,11 @@ export function RunLog({ entries, onRemove, onClear }: { entries: RunEntry[]; on
       </div>
 
       <div className="overflow-x-auto">
-        <h3 className="mb-1.5 text-xs font-medium text-ink-2">Resumen por ángulo y método (la desviación estándar necesita al menos dos repeticiones)</h3>
-        <table className="w-full min-w-[40rem] text-sm">
+        <h3 className="mb-1.5 text-xs font-medium text-ink-2">Resumen por ángulo y método</h3>
+        <table className="w-full min-w-[48rem] text-sm">
           <thead>
             <tr className="text-left">
-              {["θ (°)", "Método", "n", "a promedio (m/s²)", "Desv. estándar", "Error de la media", "a teórica (m/s²)"].map((h) => (
+              {["θ (°)", "Método", "Videos", "Análisis", "a promedio (m/s²)", "Desv. entre videos", "Error de la media", "Repetir el análisis", "a teórica (m/s²)"].map((h) => (
                 <th key={h} scope="col" className="pb-1.5 pr-3 font-semibold">{h}</th>
               ))}
             </tr>
@@ -77,15 +78,25 @@ export function RunLog({ entries, onRemove, onClear }: { entries: RunEntry[]; on
               <tr key={`${s.thetaDeg}|${s.method}`} className="border-t border-line font-mono tabular-nums">
                 <td className="py-1.5 pr-3">{s.thetaDeg}</td>
                 <td className="py-1.5 pr-3 font-sans">{s.method}</td>
-                <td className="py-1.5 pr-3">{s.n}</td>
+                <td className="py-1.5 pr-3">{s.videos}</td>
+                <td className="py-1.5 pr-3">{s.analyses}</td>
                 <td className="py-1.5 pr-3">{s.mean.toFixed(3)}</td>
                 <td className="py-1.5 pr-3">{fixed(s.sd, 3)}</td>
                 <td className="py-1.5 pr-3">{fixed(s.sem, 3)}</td>
+                <td className="py-1.5 pr-3">{fixed(s.withinSd, 3)}</td>
                 <td className="py-1.5 pr-3">{s.theory.toFixed(3)}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-ink-2">
+          <li>
+            <span className="font-medium text-foreground">Desv. entre videos</span> y <span className="font-medium text-foreground">error de la media</span>: dispersión entre grabaciones distintas, es decir, la repetibilidad del experimento. Necesitan al menos dos videos. Los videos se reconocen por el nombre del archivo.
+          </li>
+          <li>
+            <span className="font-medium text-foreground">Repetir el análisis</span>: cuánto cambia a al analizar otra vez el mismo video (por ejemplo, porque Gemini no responde siempre igual). Es repetibilidad del cálculo, no del experimento: esos análisis usan las mismas imágenes, la misma regla y el mismo carrito, así que se promedian como un solo dato.
+          </li>
+        </ul>
       </div>
 
       <details className="overflow-x-auto">

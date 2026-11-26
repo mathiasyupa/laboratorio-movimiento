@@ -17,8 +17,12 @@ export type RunEntry = {
   msPerFrame: number | null;
   manualRmseMm: number | null;
   manualRmseNoOffsetMm: number | null;
-  // Las corridas guardadas antes de agregar el desfase no lo traen.
+  // Las corridas guardadas antes de agregar estos campos no los traen.
   manualOffsetMm?: number | null;
+  uAFit?: number;
+  uACalibration?: number;
+  v0?: number;
+  uV0?: number;
 };
 
 const STORAGE_KEY = "lab-movimiento-corridas";

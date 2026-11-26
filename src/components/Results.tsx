@@ -4,9 +4,12 @@ import { useMemo, useState } from "react";
 import {
   alongRampErrors,
   discrepancy,
+  fitLinear,
   fitQuadratic,
   localDerivatives,
+  repeatStats,
   resistanceFromAcceleration,
+  runsTest,
   theoreticalAcceleration,
   toRampAxis,
   trackingError,
@@ -39,8 +42,12 @@ export type RawRun = {
 const MIN_FRAMES_WITHOUT_OFFSET = 3;
 const MIN_COMMON_FRAMES = 4;
 const COMPATIBLE_SIGMAS = 2;
+// El término cuadrático se acepta si a es al menos este número de veces su incertidumbre estadística.
+const SIGNIFICANT_SIGMAS = 2;
+// Con z por debajo de −2 en la prueba de rachas, los residuos tienen un patrón.
+const RUNS_PATTERN_Z = -2;
 
-type ChartId = "position" | "velocity" | "acceleration" | "error";
+type ChartId = "position" | "velocity" | "acceleration" | "residuals" | "error";
 
 const METHODS = [
   { key: "color", label: "Convencional (color)", colorVar: "--series-1" },
@@ -52,28 +59,36 @@ function analyzeMethod(detections: Detection[], run: RawRun) {
   const positions = toRampAxis(detections, run.ruler, run.metersPerPixel);
   const fit = fitQuadratic(times, positions);
   if (!fit) return null;
-  // La escala multiplica todas las posiciones, así que su error relativo pasa igual a la aceleración.
-  const acceleration: Measured = { value: fit.a, u: Math.hypot(fit.uA, fit.a * run.calibrationRelativeUncertainty) };
-  // La velocidad también se mide con la escala de la regla, así que hereda su incertidumbre relativa.
-  const speed = (t: number): Measured => {
-    const value = fit.velocityAt(t);
-    return { value, u: Math.hypot(fit.velocityU(t), value * run.calibrationRelativeUncertainty) };
-  };
+  // La escala de la regla multiplica todas las posiciones: su error relativo pasa igual a x₀, v y a.
+  const scaled = (value: number, statistical: number): Measured => ({
+    value,
+    u: Math.hypot(statistical, value * run.calibrationRelativeUncertainty),
+  });
+  const acceleration = scaled(fit.a, fit.uA);
   const start = times[0];
   const end = times[times.length - 1];
+  const residuals = times.map((t, i) => positions[i] - fit.at(t));
   return {
     times,
     positions,
     fit,
     acceleration,
+    // Las dos partes de la incertidumbre de a, antes de combinarlas.
+    uncertainty: { fit: fit.uA, calibration: Math.abs(fit.a) * run.calibrationRelativeUncertainty },
+    residuals,
     local: localDerivatives(times, positions),
     resistance: resistanceFromAcceleration(acceleration, run.model),
     motion: {
-      x0: fit.at(start),
-      v0: speed(start),
-      vf: speed(end),
+      x0: scaled(fit.at(start), fit.positionU(start)),
+      v0: scaled(fit.velocityAt(start), fit.velocityU(start)),
+      vf: scaled(fit.velocityAt(end), fit.velocityU(end)),
       distance: fit.at(end) - fit.at(start),
       duration: end - start,
+    },
+    model: {
+      linearRmse: fitLinear(times, positions)?.rmse ?? null,
+      significance: fit.uA > 0 ? Math.abs(fit.a) / fit.uA : null,
+      runs: runsTest(residuals),
     },
   };
 }
@@ -137,6 +152,14 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
   const color = useMemo(() => analyzeMethod(frames.color, run), [frames, run]);
   const gemini = useMemo(() => analyzeMethod(frames.gemini, run), [frames, run]);
   const theory = useMemo(() => theoreticalAcceleration(run.model), [run]);
+  // Cuánto aporta cada dato de entrada a la incertidumbre teórica.
+  const theoryParts = useMemo(
+    () => ({
+      theta: theoreticalAcceleration({ ...run.model, uMu: 0 }).u,
+      mu: theoreticalAcceleration({ ...run.model, uThetaDeg: 0 }).u,
+    }),
+    [run],
+  );
   const analyses = { color, gemini };
   const isFlat = run.model.thetaDeg === 0;
 
@@ -144,6 +167,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
     const position: ChartSeries[] = [];
     const velocity: ChartSeries[] = [];
     const acceleration: ChartSeries[] = [];
+    const residuals: ChartSeries[] = [];
     let tMin = Infinity;
     let tMax = -Infinity;
     for (const method of METHODS) {
@@ -166,9 +190,11 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
         { ...base, label: `${method.label}: medido`, style: "points", points: result.local.acceleration },
         { ...base, label: `${method.label}: ajuste`, style: "line", points: curve(first, last, () => result.fit.a) },
       );
+      residuals.push({ ...base, label: method.label, style: "points", points: result.times.map((t, i) => ({ x: t, y: result.residuals[i] * 1000 })) });
     }
     if (acceleration.length > 0) {
       acceleration.push({ label: "Teórica (modelo)", colorVar: "--ink-2", style: "dashed", points: curve(tMin, tMax, () => theory.value) });
+      residuals.push({ label: "Cero", colorVar: "--ink-2", style: "dashed", points: [{ x: tMin, y: 0 }, { x: tMax, y: 0 }] });
     }
 
     const error: ChartSeries[] = [];
@@ -182,7 +208,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
       const times = marks.map((m) => m.t);
       error.push({ label: "Sin error", colorVar: "--ink-2", style: "dashed", points: [{ x: Math.min(...times), y: 0 }, { x: Math.max(...times), y: 0 }] });
     }
-    return { position, velocity, acceleration, error };
+    return { position, velocity, acceleration, residuals, error };
   }, [color, gemini, theory, frames, marks, run]);
 
   const betweenMethods = useMemo(() => {
@@ -233,6 +259,10 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
         method: matched ? `${method.label} · mismos fotogramas` : method.label,
         a: result.acceleration.value,
         uA: result.acceleration.u,
+        uAFit: result.uncertainty.fit,
+        uACalibration: result.uncertainty.calibration,
+        v0: result.motion.v0.value,
+        uV0: result.motion.v0.u,
         aTheory: theory.value,
         uTheory: theory.u,
         diffPct: differencePct(result.acceleration),
@@ -287,6 +317,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
     { id: "position", label: "Posición" },
     { id: "velocity", label: "Velocidad" },
     { id: "acceleration", label: "Aceleración" },
+    { id: "residuals", label: "Residuos" },
     ...(marks.length > 0 ? [{ id: "error" as const, label: "Error de seguimiento" }] : []),
   ];
   const activeChart: ChartId = chart === "error" && marks.length === 0 ? "position" : chart;
@@ -297,16 +328,20 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
     value: r.motion.v0.value + theory.value * r.motion.duration,
     u: Math.hypot(r.motion.v0.u, theory.u * r.motion.duration),
   });
-  // Promedio de μ de las corridas en plano ya guardadas, por método.
+  // Promedio de μ de las corridas en plano ya guardadas, por método; cada video cuenta una sola vez.
   const flatFriction = (key: "color" | "gemini") => {
     const label = METHODS.find((m) => m.key === key)!.label;
-    const values = savedRuns.filter((e) => e.thetaDeg === 0 && e.method === label).map((e) => e.mu);
-    const n = values.length;
-    if (n === 0) return "—";
-    const mean = values.reduce((sum, v) => sum + v, 0) / n;
-    if (n === 1) return `${mean.toFixed(4)} (n = 1)`;
-    const sd = Math.sqrt(values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (n - 1));
-    return `${mean.toFixed(4)} ± ${(sd / Math.sqrt(n)).toFixed(4)} (n = ${n})`;
+    const items = savedRuns.filter((e) => e.thetaDeg === 0 && e.method === label).map((e) => ({ video: e.video, value: e.mu }));
+    if (items.length === 0) return "—";
+    const stats = repeatStats(items);
+    const videos = `${stats.videos} ${stats.videos === 1 ? "video" : "videos"}`;
+    return stats.sem === null ? `${stats.mean.toFixed(4)} (${videos})` : `${stats.mean.toFixed(4)} ± ${stats.sem.toFixed(4)} (${videos})`;
+  };
+  const modelChoice = (r: NonNullable<typeof color>) => {
+    const { significance, runs } = r.model;
+    if (significance === null) return "—";
+    const chosen = significance >= SIGNIFICANT_SIGMAS ? "Aceleración constante" : "Velocidad constante";
+    return runs && runs.z < RUNS_PATTERN_Z ? `${chosen}, pero con patrón` : chosen;
   };
 
   const motionCard = (color || gemini) && (
@@ -322,18 +357,34 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
                 <span aria-hidden className="mr-1.5 inline-block size-2 rounded-full" style={{ background: `var(${method.colorVar})` }} />
                 {method.label}
               </p>
-              <p>x(τ) = {r.motion.x0.toFixed(3)} {signed(r.motion.v0.value, 3)}·τ {signed(r.acceleration.value / 2, 3)}·τ²</p>
+              <p>x(τ) = {r.motion.x0.value.toFixed(3)} {signed(r.motion.v0.value, 3)}·τ {signed(r.acceleration.value / 2, 3)}·τ²</p>
               <p>v(τ) = {r.motion.v0.value.toFixed(3)} {signed(r.acceleration.value, 3)}·τ</p>
             </div>
           );
         })}
       </div>
-      <p className="text-xs text-ink-2">
-        x en metros y τ = t − t₀ en segundos, con t₀ el inicio del tramo analizado. Los coeficientes salen del ajuste por mínimos cuadrados: el de τ² es a/2.
-      </p>
       {table(
         <>
-          {row("Velocidad inicial v₀ (m/s)", (k) => metric(k, (r) => withU(r.motion.v0, 3)))}
+          {row("x₀: posición inicial (m)", (k) => metric(k, (r) => withU(r.motion.x0, 4)))}
+          {row("v₀: velocidad inicial (m/s)", (k) => metric(k, (r) => withU(r.motion.v0, 3)))}
+          {row("a/2: coeficiente de τ² (m/s²)", (k) => metric(k, (r) => withU({ value: r.acceleration.value / 2, u: r.acceleration.u / 2 }, 4)))}
+          {row("a = 2·(a/2): aceleración (m/s²)", (k) => metric(k, (r) => withU(r.acceleration, 3)))}
+        </>,
+      )}
+      <ul className="list-disc space-y-1 pl-4 text-xs text-ink-2">
+        <li>
+          <span className="font-medium text-foreground">Sistema de referencia:</span> eje x a lo largo de la regla, positivo en el sentido en que avanza el carrito; origen x = 0 donde se detectó el carrito en el primer fotograma del tramo; τ = t − t₀ en segundos, con t₀ el inicio del tramo.
+        </li>
+        <li><span className="font-medium text-foreground">x₀</span> es dónde estaba el carrito en τ = 0 según el ajuste. Sale casi 0 por la elección del origen; no es exactamente 0 porque la primera detección tiene error.</li>
+        <li><span className="font-medium text-foreground">v₀</span> es la velocidad en τ = 0: casi 0 si el carrito se soltó desde el reposo al inicio del tramo.</li>
+        <li><span className="font-medium text-foreground">a/2</span> es la mitad de la aceleración, porque x = x₀ + v₀τ + ½aτ². Su doble es la aceleración que se compara con la teoría.</li>
+        <li>
+          <span className="font-medium text-foreground">¿Por qué una parábola?</span> En un plano recto con ángulo fijo, el peso, la normal y la resistencia son constantes, así que la fuerza neta y la aceleración también lo son, y la posición queda cuadrática en el tiempo. Vale solo mientras el carrito avanza libre: sin empujones, sin chocar con el tope y sin una resistencia que crezca con la velocidad. La tarjeta «¿Qué modelo describe el movimiento?» lo comprueba con los datos.
+        </li>
+      </ul>
+      <p className="text-xs text-ink-2">Cada ± combina la dispersión de los puntos alrededor del ajuste con la incertidumbre de la regla.</p>
+      {table(
+        <>
           {row("Velocidad final v_f (m/s)", (k) => metric(k, (r) => withU(r.motion.vf, 3)))}
           {row("v_f que predice el modelo (m/s)", (k) => metric(k, (r) => withU(predictedFinalSpeed(r), 3)))}
           {row("Distancia en el tramo (m)", (k) => metric(k, (r) => r.motion.distance.toFixed(3)))}
@@ -341,6 +392,39 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
         </>,
       )}
       <p className="text-xs text-ink-2">La v_f del modelo es v₀ medida + a teórica · duración; así se ve cuánto se aleja la realidad de la predicción.</p>
+    </div>
+  );
+
+  const modelCard = (color || gemini) && (
+    <div className="space-y-3 rounded-lg border border-line bg-surface p-4">
+      <h3 className="text-sm font-semibold">¿Qué modelo describe el movimiento?</h3>
+      {table(
+        <>
+          {row("Residuo con velocidad constante (mm)", (k) => metric(k, (r) => (r.model.linearRmse === null ? "—" : (r.model.linearRmse * 1000).toFixed(2))))}
+          {row("Residuo con aceleración constante (mm)", (k) => metric(k, (r) => (r.fit.rmse * 1000).toFixed(2)))}
+          {row("a comparada con su incertidumbre", (k) => metric(k, (r) => (r.model.significance === null ? "—" : `${r.model.significance.toFixed(1)} veces`)))}
+          {row("Residuos sin patrón (rachas)", (k) => metric(k, (r) => {
+            const runs = r.model.runs;
+            if (!runs) return "pocos datos";
+            return `${runs.z < RUNS_PATTERN_Z ? "no" : "sí"} (${runs.runs} de ~${runs.expected.toFixed(0)})`;
+          }))}
+          {row("Modelo que eligen los datos", (k) => metric(k, modelChoice))}
+        </>,
+      )}
+      <ul className="list-disc space-y-1 pl-4 text-xs text-ink-2">
+        <li>
+          Se prueban dos modelos: <span className="font-mono">x = x₀ + v·τ</span> (velocidad constante) y <span className="font-mono">x = x₀ + v₀τ + ½aτ²</span> (aceleración constante). El residuo es cuánto se separan, en promedio, los puntos de cada curva.
+        </li>
+        <li>
+          Una curva con más parámetros siempre ajusta un poco mejor. Por eso la aceleración constante solo se elige si a es al menos {SIGNIFICANT_SIGMAS} veces su incertidumbre; si no, la diferencia podría ser solo ruido.
+        </li>
+        <li>
+          Si el modelo es correcto, los residuos (pestaña <span className="font-medium text-foreground">Residuos</span>) quedan como ruido alrededor de cero y cambian de signo a menudo (rachas). Pocas rachas (residuos agrupados en forma de U, de S o de serrucho) indican que falta algo: la aceleración cambió en el tramo, hubo un choque, la cámara deforma la escala o el video tiene fps variable (muchos celulares graban así) y los fotogramas no están igual de espaciados en el tiempo.
+        </li>
+        <li>
+          <span className="font-medium text-foreground">Un R² cercano a 1 no garantiza que a sea exacta.</span> Un error de escala, como una cámara no perpendicular o una regla fuera del plano del carrito, cambia a en el mismo porcentaje sin empeorar el ajuste. Por eso dos métodos pueden tener R² ≈ 1 y aceleraciones distintas.
+        </li>
+      </ul>
     </div>
   );
 
@@ -355,7 +439,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
       )}
       <p className="text-xs text-ink-2">
         {isFlat
-          ? "En plano, μ sale de la desaceleración: μ = |a|·(1 + I/MR²) / g. Para usarlo en las corridas en rampa, copia en la pestaña Carrito el promedio de varias corridas guardadas (el ± del promedio es el error de la media)."
+          ? "En plano, μ sale de la desaceleración: μ = |a|·(1 + I/MR²) / g. Para usarlo en las corridas en rampa, copia en la pestaña Carrito el promedio de varias grabaciones guardadas. El ± del promedio es el error de la media entre videos distintos: analizar otra vez el mismo video no cuenta como repetición."
           : "Es el μ que haría coincidir el modelo con esta medición. Para validar el modelo, compáralo con el μ medido en plano."}
       </p>
       <p className="text-xs text-ink-2">
@@ -381,6 +465,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
           <p className="text-xs text-ink-2">
             <span className="font-semibold text-foreground">Teoría: </span>
             <span className="font-mono tabular-nums text-foreground">a = {withU(theory, 3)} m/s²</span>
+            {` (± por θ: ${theoryParts.theta.toFixed(3)}, por μ: ${theoryParts.mu.toFixed(3)})`}
             {` · θ = ${run.model.thetaDeg}° ± ${run.model.uThetaDeg}°, μ = ${run.model.mu} ± ${run.model.uMu}, I/MR² = ${run.model.inertiaRatio.toFixed(4)}, g = ${run.model.g}`}
           </p>
           {isFlat && run.model.mu === 0 && (
@@ -421,6 +506,8 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
           {table(
             <>
               {row("Aceleración medida (m/s²)", (k) => metric(k, (r) => withU(r.acceleration, 3)))}
+              {row("   ± por el ajuste (puntos)", (k) => metric(k, (r) => r.uncertainty.fit.toFixed(3)))}
+              {row("   ± por la regla (escala)", (k) => metric(k, (r) => r.uncertainty.calibration.toFixed(3)))}
               {row("Diferencia con la teoría", (k) => metric(k, (r) => {
                 const pct = differencePct(r.acceleration);
                 return pct === null ? "—" : `${pct.toFixed(1)} %`;
@@ -437,6 +524,9 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
               )}
             </>,
           )}
+          <p className="text-xs text-ink-2">
+            El ± de a junta dos fuentes de este video: la dispersión de los puntos alrededor del ajuste y la incertidumbre de la regla. <span className="font-medium text-foreground">No incluye</span> el error por perspectiva (cámara no perpendicular) ni la variación entre grabaciones distintas: esa se ve guardando varios videos en «Corridas guardadas».
+          </p>
           {marks.length > 0 && (
             <p className="text-xs text-ink-2">
               El <span className="font-medium text-foreground">desfase fijo</span> es el error que se repite igual en todos los fotogramas (por ejemplo, Gemini marca el centro de la caja del carrito y el método por color, el centro de la marca). La <span className="font-medium text-foreground">variación</span> es lo que cambia de un fotograma a otro. Se cumple: total² = desfase² + variación². Con menos de {MIN_FRAMES_WITHOUT_OFFSET} fotogramas marcados no se separan.
@@ -483,7 +573,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
         <div className="min-w-0 space-y-4">
         {charts.position.length > 0 && (
           <div className="min-w-0 rounded-lg border border-line bg-surface p-4">
-            <div role="tablist" aria-label="Gráfica" className="mb-3 inline-flex rounded-md border border-line p-0.5">
+            <div role="tablist" aria-label="Gráfica" className="mb-3 inline-flex flex-wrap rounded-md border border-line p-0.5">
               {chartTabs.map((tab) => (
                 <button
                   key={tab.id}
@@ -524,6 +614,15 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
                 series={charts.acceleration}
               />
             )}
+            {activeChart === "residuals" && (
+              <KinematicsChart
+                title="Residuos del ajuste"
+                hint="Posición medida menos la parábola ajustada. Si el modelo es correcto, los puntos quedan al azar alrededor de cero; una forma de U o de S indica que la aceleración no fue constante o que la escala cambia a lo largo de la imagen; un serrucho, que los fotogramas no están igual de espaciados (fps variable)."
+                yLabel="Medido − ajuste (mm)"
+                unit="mm"
+                series={charts.residuals}
+              />
+            )}
             {activeChart === "error" && (
               <KinematicsChart
                 title="Error de seguimiento"
@@ -536,6 +635,7 @@ export function Results({ run, marks, savedRuns, onSave }: Props) {
           </div>
         )}
         {motionCard}
+        {modelCard}
         {frictionCard}
         </div>
       </div>

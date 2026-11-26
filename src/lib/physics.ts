@@ -9,7 +9,8 @@ export type QuadraticFit = {
   rmse: number;
   at: (t: number) => number;
   velocityAt: (t: number) => number;
-  // Incertidumbre estadística de la velocidad del ajuste en un instante.
+  // Incertidumbres estadísticas de la posición y la velocidad del ajuste en un instante.
+  positionU: (t: number) => number;
   velocityU: (t: number) => number;
 };
 
@@ -63,6 +64,9 @@ export function fitQuadratic(t: number[], s: number[]): QuadraticFit | null {
   });
 
   const variance = n > 3 ? residual / (n - 3) : 0;
+  // Varianza de g·c para un gradiente g respecto de los coeficientes (c0, c1, c2): σ²·gᵀ·inverse·g.
+  const spread = (g: number[]) =>
+    Math.sqrt(Math.max(variance * g.reduce((sum, gi, i) => sum + gi * g.reduce((row, gj, j) => row + inverse[i][j] * gj, 0), 0), 0));
   return {
     a: 2 * c2,
     uA: 2 * Math.sqrt(Math.max(variance * inverse[2][2], 0)),
@@ -70,11 +74,78 @@ export function fitQuadratic(t: number[], s: number[]): QuadraticFit | null {
     rmse: Math.sqrt(residual / n),
     at,
     velocityAt: (time) => c1 + 2 * c2 * (time - tMean),
-    // v = c1 + 2·c2·τ: su varianza sale de la covarianza de los coeficientes, σ²·inverse.
-    velocityU: (time) => {
+    // x = c0 + c1·τ + c2·τ² y v = c1 + 2·c2·τ: sus varianzas salen de la covarianza de los coeficientes.
+    positionU: (time) => {
       const tau = time - tMean;
-      return Math.sqrt(Math.max(variance * (inverse[1][1] + 4 * tau * inverse[1][2] + 4 * tau * tau * inverse[2][2]), 0));
+      return spread([1, tau, tau * tau]);
     },
+    velocityU: (time) => spread([0, 1, 2 * (time - tMean)]),
+  };
+}
+
+// Modelo de velocidad constante, x(t) = x₀ + v·t, para compararlo con el de aceleración constante.
+export function fitLinear(t: number[], s: number[]) {
+  const n = t.length;
+  if (n < 3) return null;
+  const tMean = t.reduce((sum, v) => sum + v, 0) / n;
+  const sMean = s.reduce((sum, v) => sum + v, 0) / n;
+  let stt = 0;
+  let sts = 0;
+  t.forEach((time, k) => {
+    stt += (time - tMean) ** 2;
+    sts += (time - tMean) * (s[k] - sMean);
+  });
+  if (stt === 0) return null;
+  const v = sts / stt;
+  const at = (time: number) => sMean + v * (time - tMean);
+  let residual = 0;
+  let total = 0;
+  t.forEach((time, k) => {
+    residual += (s[k] - at(time)) ** 2;
+    total += (s[k] - sMean) ** 2;
+  });
+  return { v, at, rmse: Math.sqrt(residual / n), r2: total > 0 ? 1 - residual / total : 0 };
+}
+
+// Prueba de rachas: si los residuos forman pocos grupos del mismo signo (z < −2), el modelo deja un patrón sin explicar.
+const MIN_RUNS_SAMPLES = 10;
+export function runsTest(residuals: number[]) {
+  const signs = residuals.filter((r) => r !== 0).map((r) => r > 0);
+  const n = signs.length;
+  const positives = signs.filter(Boolean).length;
+  const negatives = n - positives;
+  if (n < MIN_RUNS_SAMPLES || positives === 0 || negatives === 0) return null;
+  const runs = 1 + signs.slice(1).filter((sign, i) => sign !== signs[i]).length;
+  const product = 2 * positives * negatives;
+  const expected = product / n + 1;
+  const variance = (product * (product - n)) / (n * n * (n - 1));
+  return { runs, expected, z: (runs - expected) / Math.sqrt(variance) };
+}
+
+// Repeticiones: los análisis del mismo video se promedian primero, porque no son experimentos independientes.
+// sd y sem salen de la dispersión entre videos; withinSd mide cuánto cambia el resultado al repetir el análisis.
+export function repeatStats(items: { video: string; value: number }[]) {
+  const byVideo = new Map<string, number[]>();
+  for (const item of items) byVideo.set(item.video, [...(byVideo.get(item.video) ?? []), item.value]);
+  const average = (values: number[]) => values.reduce((sum, v) => sum + v, 0) / values.length;
+  const means = [...byVideo.values()].map(average);
+  const videos = means.length;
+  const mean = average(means);
+  const sd = videos > 1 ? Math.sqrt(means.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (videos - 1)) : null;
+  let squares = 0;
+  let freedom = 0;
+  for (const values of byVideo.values()) {
+    const m = average(values);
+    squares += values.reduce((sum, v) => sum + (v - m) ** 2, 0);
+    freedom += values.length - 1;
+  }
+  return {
+    videos,
+    analyses: items.length,
+    mean,
+    sd,
+    sem: sd === null ? null : sd / Math.sqrt(videos),
+    withinSd: freedom > 0 ? Math.sqrt(squares / freedom) : null,
   };
 }
 
