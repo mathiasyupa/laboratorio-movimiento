@@ -9,6 +9,8 @@ export type QuadraticFit = {
   rmse: number;
   at: (t: number) => number;
   velocityAt: (t: number) => number;
+  // Incertidumbre estadística de la velocidad del ajuste en un instante.
+  velocityU: (t: number) => number;
 };
 
 function invert3(m: number[][]): number[][] | null {
@@ -68,6 +70,11 @@ export function fitQuadratic(t: number[], s: number[]): QuadraticFit | null {
     rmse: Math.sqrt(residual / n),
     at,
     velocityAt: (time) => c1 + 2 * c2 * (time - tMean),
+    // v = c1 + 2·c2·τ: su varianza sale de la covarianza de los coeficientes, σ²·inverse.
+    velocityU: (time) => {
+      const tau = time - tMean;
+      return Math.sqrt(Math.max(variance * (inverse[1][1] + 4 * tau * inverse[1][2] + 4 * tau * tau * inverse[2][2]), 0));
+    },
   };
 }
 

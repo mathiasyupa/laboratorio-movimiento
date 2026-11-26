@@ -54,6 +54,13 @@ function analyzeMethod(detections: Detection[], run: RawRun) {
   if (!fit) return null;
   // La escala multiplica todas las posiciones, así que su error relativo pasa igual a la aceleración.
   const acceleration: Measured = { value: fit.a, u: Math.hypot(fit.uA, fit.a * run.calibrationRelativeUncertainty) };
+  // La velocidad también se mide con la escala de la regla, así que hereda su incertidumbre relativa.
+  const speed = (t: number): Measured => {
+    const value = fit.velocityAt(t);
+    return { value, u: Math.hypot(fit.velocityU(t), value * run.calibrationRelativeUncertainty) };
+  };
+  const start = times[0];
+  const end = times[times.length - 1];
   return {
     times,
     positions,
@@ -61,6 +68,13 @@ function analyzeMethod(detections: Detection[], run: RawRun) {
     acceleration,
     local: localDerivatives(times, positions),
     resistance: resistanceFromAcceleration(acceleration, run.model),
+    motion: {
+      x0: fit.at(start),
+      v0: speed(start),
+      vf: speed(end),
+      distance: fit.at(end) - fit.at(start),
+      duration: end - start,
+    },
   };
 }
 
@@ -88,9 +102,9 @@ function downloadCsv(run: RawRun, marks: Detection[]) {
   URL.revokeObjectURL(url);
 }
 
-type Props = { run: RawRun; marks: Detection[]; onSave: (entries: RunEntry[]) => void };
+type Props = { run: RawRun; marks: Detection[]; savedRuns: RunEntry[]; onSave: (entries: RunEntry[]) => void };
 
-export function Results({ run, marks, onSave }: Props) {
+export function Results({ run, marks, savedRuns, onSave }: Props) {
   const [savedFor, setSavedFor] = useState<{ marks: Detection[]; matched: boolean } | null>(null);
   const [chart, setChart] = useState<ChartId>("position");
   const [sameFrames, setSameFrames] = useState(false);
@@ -278,6 +292,78 @@ export function Results({ run, marks, onSave }: Props) {
   const activeChart: ChartId = chart === "error" && marks.length === 0 ? "position" : chart;
   const frameCount = (key: "color" | "gemini") => (key === "color" ? frames.color.length : frames.gemini.length);
 
+  const signed = (n: number, digits: number) => `${n < 0 ? "−" : "+"} ${Math.abs(n).toFixed(digits)}`;
+  const predictedFinalSpeed = (r: NonNullable<typeof color>): Measured => ({
+    value: r.motion.v0.value + theory.value * r.motion.duration,
+    u: Math.hypot(r.motion.v0.u, theory.u * r.motion.duration),
+  });
+  // Promedio de μ de las corridas en plano ya guardadas, por método.
+  const flatFriction = (key: "color" | "gemini") => {
+    const label = METHODS.find((m) => m.key === key)!.label;
+    const values = savedRuns.filter((e) => e.thetaDeg === 0 && e.method === label).map((e) => e.mu);
+    const n = values.length;
+    if (n === 0) return "—";
+    const mean = values.reduce((sum, v) => sum + v, 0) / n;
+    if (n === 1) return `${mean.toFixed(4)} (n = 1)`;
+    const sd = Math.sqrt(values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (n - 1));
+    return `${mean.toFixed(4)} ± ${(sd / Math.sqrt(n)).toFixed(4)} (n = ${n})`;
+  };
+
+  const motionCard = (color || gemini) && (
+    <div className="space-y-3 rounded-lg border border-line bg-surface p-4">
+      <h3 className="text-sm font-semibold">Ajuste del movimiento</h3>
+      <div className="space-y-2 font-mono text-xs tabular-nums">
+        {visibleMethods.map((method) => {
+          const r = analyses[method.key];
+          if (!r) return null;
+          return (
+            <div key={method.key} className="space-y-0.5">
+              <p className="font-sans font-medium">
+                <span aria-hidden className="mr-1.5 inline-block size-2 rounded-full" style={{ background: `var(${method.colorVar})` }} />
+                {method.label}
+              </p>
+              <p>x(τ) = {r.motion.x0.toFixed(3)} {signed(r.motion.v0.value, 3)}·τ {signed(r.acceleration.value / 2, 3)}·τ²</p>
+              <p>v(τ) = {r.motion.v0.value.toFixed(3)} {signed(r.acceleration.value, 3)}·τ</p>
+            </div>
+          );
+        })}
+      </div>
+      <p className="text-xs text-ink-2">
+        x en metros y τ = t − t₀ en segundos, con t₀ el inicio del tramo analizado. Los coeficientes salen del ajuste por mínimos cuadrados: el de τ² es a/2.
+      </p>
+      {table(
+        <>
+          {row("Velocidad inicial v₀ (m/s)", (k) => metric(k, (r) => withU(r.motion.v0, 3)))}
+          {row("Velocidad final v_f (m/s)", (k) => metric(k, (r) => withU(r.motion.vf, 3)))}
+          {row("v_f que predice el modelo (m/s)", (k) => metric(k, (r) => withU(predictedFinalSpeed(r), 3)))}
+          {row("Distancia en el tramo (m)", (k) => metric(k, (r) => r.motion.distance.toFixed(3)))}
+          {row("Duración del tramo (s)", (k) => metric(k, (r) => r.motion.duration.toFixed(2)))}
+        </>,
+      )}
+      <p className="text-xs text-ink-2">La v_f del modelo es v₀ medida + a teórica · duración; así se ve cuánto se aleja la realidad de la predicción.</p>
+    </div>
+  );
+
+  const frictionCard = (color || gemini) && (
+    <div className="space-y-3 rounded-lg border border-line bg-surface p-4">
+      <h3 className="text-sm font-semibold">Coeficiente de rozamiento μ</h3>
+      {table(
+        <>
+          {row(isFlat ? "μ de esta corrida (en plano)" : "μ que explicaría esta medición", (k) => metric(k, (r) => withU(r.resistance, 4)))}
+          {row("Promedio de corridas en plano guardadas", (k) => flatFriction(k))}
+        </>,
+      )}
+      <p className="text-xs text-ink-2">
+        {isFlat
+          ? "En plano, μ sale de la desaceleración: μ = |a|·(1 + I/MR²) / g. Para usarlo en las corridas en rampa, copia en la pestaña Carrito el promedio de varias corridas guardadas (el ± del promedio es el error de la media)."
+          : "Es el μ que haría coincidir el modelo con esta medición. Para validar el modelo, compáralo con el μ medido en plano."}
+      </p>
+      <p className="text-xs text-ink-2">
+        Con ruedas, μ resume la resistencia a la rodadura (incluida la fricción en los ejes), no la fricción de deslizamiento. Si el carrito se desliza sin ruedas (sin masa de ruedas en la pestaña Carrito), μ es el coeficiente de fricción cinética.
+      </p>
+    </div>
+  );
+
   return (
     <section className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -340,6 +426,7 @@ export function Results({ run, marks, onSave }: Props) {
                 return pct === null ? "—" : `${pct.toFixed(1)} %`;
               }))}
               {row("Discrepancia", (k) => metric(k, (r) => sigmaText(discrepancy(r.acceleration, theory))))}
+              {row("R² del ajuste", (k) => metric(k, (r) => r.fit.r2.toFixed(4)))}
               {row(isFlat ? "μ medido en plano" : "μ que explicaría la medición", (k) => metric(k, (r) => withU(r.resistance, 4)))}
               {marks.length > 0 && (
                 <>
@@ -366,7 +453,6 @@ export function Results({ run, marks, onSave }: Props) {
             <div className="mt-3 space-y-3">
               {table(
                 <>
-                  {row("R² del ajuste cuadrático", (k) => metric(k, (r) => r.fit.r2.toFixed(4)))}
                   {row("Residuo del ajuste (mm)", (k) => metric(k, (r) => (r.fit.rmse * 1000).toFixed(2)))}
                   {row("Fotogramas usados", (k) =>
                     matched
@@ -394,6 +480,7 @@ export function Results({ run, marks, onSave }: Props) {
           {marks.length === 0 && <p className="text-xs text-ink-2">Para guardar el error de seguimiento, marca fotogramas a mano antes de guardar la corrida.</p>}
         </div>
 
+        <div className="min-w-0 space-y-4">
         {charts.position.length > 0 && (
           <div className="min-w-0 rounded-lg border border-line bg-surface p-4">
             <div role="tablist" aria-label="Gráfica" className="mb-3 inline-flex rounded-md border border-line p-0.5">
@@ -448,6 +535,9 @@ export function Results({ run, marks, onSave }: Props) {
             )}
           </div>
         )}
+        {motionCard}
+        {frictionCard}
+        </div>
       </div>
     </section>
   );

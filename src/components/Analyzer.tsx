@@ -890,7 +890,7 @@ export function Analyzer() {
       </div>
 
       {message && <p role="alert" className="rounded-lg border border-line bg-surface p-3 text-sm">{message}</p>}
-      {run && <Results run={run} marks={marks} onSave={(entries) => setRuns([...savedRuns, ...entries])} />}
+      {run && <Results run={run} marks={marks} savedRuns={savedRuns} onSave={(entries) => setRuns([...savedRuns, ...entries])} />}
       <RunLog
         entries={savedRuns}
         onRemove={(id) => setRuns(savedRuns.filter((entry) => entry.id !== id))}
